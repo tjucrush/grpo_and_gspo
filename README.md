@@ -1,33 +1,104 @@
 # GRPO vs GSPO
-本项目使用deepseek grpo和qwen gspo方法对qwen2.5-1.5B-Instruct模型在GSM8K数据集上的全量微调, 完整地复现了[GRPO算法](https://arxiv.org/pdf/2402.03300)和[GSPO算法](https://arxiv.org/pdf/2507.18071)进行对比, 包括旧策略采样、参考策略采样和新策略训练. 本项中搭建的分布式训练框架适合off policy方法与deepspeed结合进行LLM分布式微调.
+
+本项目从零实现并对比 [DeepSeekMath GRPO](https://arxiv.org/pdf/2402.03300) 与 [Qwen GSPO](https://arxiv.org/pdf/2507.18071)，使用 Qwen2.5-1.5B-Instruct 在 GSM8K 上进行强化学习微调。项目覆盖旧策略采样、参考策略 KL 约束、新策略训练、组内优势归一化、分布式数据传输和模型参数同步，并同时支持全量微调与 LoRA。
+
+这个仓库重点回答两个问题：
+
+1. 不训练 Critic 的情况下，如何利用同一问题的多条回答构造相对优势并优化语言模型？
+2. 将重要性采样从 token 级提升到序列级后，为什么 GSPO 通常比 GRPO 更稳定？
+
+> 本项目面向算法学习和小规模实验复现。训练脚本采用采样、训练双进程设计，适合研究 off-policy 策略优化与 DeepSpeed 分布式训练的组合方式。
 
 ## 训练框架
 ![框图](./docs/framework.png)
 
-项目主要分为采样进程和训练进程:
-* 采样进程: 旧策略轨迹采样 + 旧策略概率分布推理 + 新策略的概率分布推理
-* 训练进程: deepspeed自动fork多个子进程Rank_n, 各子进程中进行数据分割及分布式训练
-* 训练数据传递: 采样进程->训练进程, 用zmq实现
-* 模型参数同步: 训练进程->采样进程, 用文件系统实现
+项目主要分为采样进程和训练进程：
 
-## GRPO算法原理
-GRPO在PPO算法的基础上改进, PPO算法为Actor-Critic网络结构, 需要同时训练Actor和Critci两个网络, 对于动辄几十亿参数的大语言模型来说训练开销太大. GRPO方法的优化点在于对同一问题采样多次, 称为一组, 用组内回报的均值来代替Critic网络, 减少了一半训练开销.
+* **采样进程**：旧策略生成回答，并分别使用旧策略和参考策略计算所选 token 的对数概率。
+* **训练进程**：DeepSpeed 启动多个 rank，主进程接收采样数据，随后将数据广播并按问题组切分到各个 rank。
+* **训练数据传递**：采样进程通过 ZeroMQ 将 episode 推送给训练主进程。
+* **模型参数同步**：训练进程定期将新策略 checkpoint 写入文件系统，采样进程加载后更新旧策略。
 
-目标函数:
+一次训练迭代可以概括为：
+
+```text
+问题 x
+  └─ 旧策略 π_old 为同一问题生成 G 条回答
+       ├─ 计算每条回答的奖励 r(x, y_i)
+       ├─ 计算旧策略 log π_old(y_i | x)
+       └─ 计算参考策略 log π_ref(y_i | x)
+              ↓ ZeroMQ
+         组内奖励标准化得到优势 A_i
+              ↓
+         新策略 π_θ 计算 log π_θ(y_i | x)
+              ↓
+       GRPO token 级比率 / GSPO 序列级比率
+              ↓
+         clipped objective + KL penalty
+              ↓
+           DeepSpeed 更新 π_θ
+```
+
+其中三种策略各自承担不同职责：
+
+| 策略 | 作用 | 是否更新 |
+| --- | --- | --- |
+| 新策略 `π_θ` | 当前正在训练的模型 | 是 |
+| 旧策略 `π_old` | 生成轨迹并作为重要性采样分母 | 定期从新策略同步 |
+| 参考策略 `π_ref` | 约束模型不要偏离初始能力过远 | 否 |
+
+## GRPO 算法原理
+
+### 1. 从 PPO 到 GRPO
+
+PPO 通常同时训练策略模型（Actor）与价值模型（Critic）。对于大语言模型，额外维护一个同等规模的 Critic 会显著增加显存、计算量和工程复杂度。
+
+GRPO（Group Relative Policy Optimization）的核心做法是：针对同一个问题生成一组共 `G` 条回答，用组内回答的相对奖励估计优势，不再单独训练价值模型。它并不是简单地“用平均奖励代替 Critic”，而是先对组内奖励做中心化和标准化，使高于本组平均水平的回答获得正优势，低于平均水平的回答获得负优势。
+
+对于问题 `x` 的第 `i` 条回答 `y_i`，组内优势为：
+
+$$
+\hat{A}_i =
+\frac{r(x,y_i)-\operatorname{mean}\left(\{r(x,y_j)\}_{j=1}^{G}\right)}
+{\operatorname{std}\left(\{r(x,y_j)\}_{j=1}^{G}\right)+\varepsilon}
+$$
+
+这种相对比较具有两个特点：
+
+* 不要求奖励在不同问题之间具有完全一致的绝对尺度。
+* 同一组回答如果奖励完全相同，则不会产生有效的相对学习信号。
+
+### 2. token 级重要性采样
+
+轨迹由旧策略生成，而梯度用于更新新策略，因此需要用重要性采样修正两个策略之间的分布差异。GRPO 为回答中的每个 token 分别计算概率比率：
+
+$$
+w_{i,t}(\theta)=
+\frac{\pi_\theta(y_{i,t}\mid x,y_{i,<t})}
+{\pi_{\theta_{old}}(y_{i,t}\mid x,y_{i,<t})}
+$$
+
+当比率明显偏离 1 时，表示新旧策略对该 token 的概率判断差距较大。PPO 风格的裁剪会将比率限制在 `1-ε` 到 `1+ε` 附近，避免单个 batch 造成过大的策略更新。
+
+### 3. GRPO 目标函数
+
+目标函数：
 
 $$
 J_{GRPO}(\theta)=E\left[\frac{1}{G} \sum_{i=1}^G \frac{1}{\left|y_i\right|} \sum_{t=1}^{\left|y_i\right|} \min \left(w_{i, t}(\theta) \hat{A}_{i, t}, \text{clip}\left(w_{i, t}(\theta), 1-\epsilon, 1+\epsilon\right) \hat{A}_{i, t}\right)\right]
 $$
+
+这里 `w_{i,t}` 是 token 级重要性采样比率，`A_i` 是第 `i` 条完整回答的组内优势。代码中还加入参考策略 KL 惩罚，用于抑制新策略过度偏离预训练模型：
+
 $$
-w_{i, t}(\theta) = \frac{\pi_\theta(y_{i,t} \mid x, y_{i<t})}{\pi_{\theta_{old}}(y_{i,t} \mid x, y_{i<t})}
-$$
-$$
-\hat{A}_{i, t}=\hat{A}_i=\frac{r(x, y_i)-\text{mean}(\{r(x, y_i)\}_{i=1}^G)}{\text{std}(\{r(x, y_i)\}_{i=1}^G)}
+D_{KL}(\pi_\theta\|\pi_{ref})
+\approx \exp(\log \pi_{ref}-\log \pi_\theta)
+-(\log \pi_{ref}-\log \pi_\theta)-1
 $$
 
-其中$w_{i,t}$表示token级别的重要性采样, $\hat{A}_{i}$表示序列的组内回报值:
+最终目标由三部分组成：相对优势、裁剪后的重要性采样，以及参考策略 KL 约束。
 
-目标函数和Loss函的核心代码实现:
+目标函数和 Loss 函数的核心代码实现：
 ```python
 ref_policy_log_probs_ = ref_policy_log_probs[:, prefix_len-1:] # 参考策略概率分布
 old_policy_log_probs_ = old_policy_log_probs[:, prefix_len-1:] # 旧策略概率分布
@@ -47,21 +118,53 @@ per_token_loss = -objective_function # loss函数
 loss = ((per_token_loss * attention_mask_).sum(dim=1) / attention_mask_.sum(dim=1)).mean() # batch的均值作为最终loss(只统计有效token的loss)
 ```
 
-## GSPO算法原理
-GSPO算法是Qwen团队最新提出的RLHF算法, 在GRPO算法基础上进行改进, 设计动机是为了解决GRPO算法序列级别的reward与token级别的重要性采样值颗粒度不对齐导致的不稳定性问题. GSPO算法的改进点为把重要性采样部分调整为序列级别. 带来了两点优势:
-* 降低token方差, 训练过程更为稳定, 用几何均值计算序列重要性采样, 能够有效缩小token的方差, 使训练过程更加稳定.
-* 对于MoE架构模型, 不再需要routing replay, 因为序列重要性天然包含对专家路由的边缘积分, 专家路由与生成模型的联合概率分布变为边缘概率分布, 可以直接进行重要性采样.
+## GSPO 算法原理
 
-$$
-J_{GSPO}(\theta)=E\left[\frac{1}{G} \sum_{i=1}^G \min \left(s_i(\theta) \hat{A}_i, \text{clip}\left(s_i(\theta), 1-\epsilon, 1+\epsilon\right) \hat{A}_i\right)\right]
-$$
+### 1. 为什么需要序列级优化
+
+GRPO 的奖励和优势属于整条回答：数学题回答正确或错误，是对完整序列的评价；但 GRPO 的重要性采样和裁剪发生在 token 级。也就是说，同一个序列共享一个优势值，却可能有数百个不同的 token 比率和裁剪结果。这种粒度不一致会放大 token 间方差，长序列和 MoE 路由变化时尤其明显。
+
+GSPO（Group Sequence Policy Optimization）保留组内相对优势，但将新旧策略的比率聚合为一个序列级比率。一条回答只产生一个重要性权重，并直接与该回答的序列奖励对齐。
+
+### 2. 序列级重要性采样
+
+完整序列概率是所有生成 token 条件概率的乘积。直接连乘容易数值下溢，而且会让比率随序列长度呈指数变化，因此 GSPO 在 log 空间求平均，再通过指数函数还原。这等价于 token 概率比率的几何平均：
+
 $$
 s_i(\theta)=\left(\frac{\pi_\theta\left(y_i \mid x\right)}{\pi_{\theta_{\text {old }}}\left(y_i \mid x\right)}\right)^{\frac{1}{\left|y_i\right|}}=\exp \left(\frac{1}{\left|y_i\right|} \sum_{t=1}^{\left|y_i\right|} \log \frac{\pi_\theta\left(y_{i, t} \mid x, y_{i,<t}\right)}{\pi_{\theta_{\text {old }}}\left(y_{i, t} \mid x, y_{i,<t}\right)}\right)
 $$
 
-其中$s_i(\theta)$表示序列重要性采样, 与序列组内回报$\hat{A}_i$颗粒度是对齐的.
+其中 `s_i(θ)` 表示第 `i` 条回答的序列级重要性采样比率。除以有效序列长度后，不同回答长度之间更容易比较，并且 `s_i(θ)` 与序列级组内优势 `A_i` 在粒度上保持一致。
 
-目标函数和Loss函数的核心代码实现:
+### 3. GSPO 目标函数与特点
+
+GSPO 对每条序列的单一比率进行裁剪：如果序列级比率仍在信任区域内，则按照优势更新；如果偏移过大，则使用裁剪后的比率限制更新幅度。
+
+$$
+J_{GSPO}(\theta)=E\left[\frac{1}{G} \sum_{i=1}^G \min \left(s_i(\theta) \hat{A}_i, \text{clip}\left(s_i(\theta), 1-\epsilon, 1+\epsilon\right) \hat{A}_i\right)\right]
+$$
+
+相较 GRPO，GSPO 的主要特点是：
+
+* **奖励与采样比率对齐**：两者都处于序列级，不再把一个序列奖励分别作用于大量独立 token 比率。
+* **降低方差**：几何平均减弱了少数极端 token 对整条序列更新的影响。
+* **长度归一化**：log 比率除以有效生成长度，降低回答长度对重要性权重尺度的影响。
+* **更适合 MoE**：序列级似然比能够对路由差异进行边缘化处理，减少对 routing replay 的依赖。
+
+### 4. GRPO 与 GSPO 对比
+
+| 对比项 | GRPO | GSPO |
+| --- | --- | --- |
+| 组内优势 | 序列级 | 序列级 |
+| 重要性采样 | token 级 | 序列级 |
+| 裁剪粒度 | 每个 token 独立裁剪 | 每条回答裁剪一次 |
+| 序列长度处理 | 对有效 token loss 求平均 | 对 log 比率按长度归一化 |
+| 更新方差 | 更容易受极端 token 影响 | 通常更低、更稳定 |
+| MoE 路由 | 可能需要额外处理路由变化 | 序列级比率更易兼容 |
+
+两种方法并不存在对所有任务都绝对成立的优劣关系。GSPO 的主要优势是优化粒度更一致、训练通常更稳定；GRPO 则保留更细粒度的 token 更新信号。在实际任务中仍需要结合奖励曲线、KL、裁剪比例、输出熵和最终准确率共同判断。
+
+目标函数和 Loss 函数的核心代码实现：
 ```python
 batch_size = ref_policy_log_probs.shape[0]
 
