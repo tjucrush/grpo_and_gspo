@@ -57,11 +57,9 @@ GRPO（Group Relative Policy Optimization）的核心做法是：针对同一个
 
 对于问题 `x` 的第 `i` 条回答 `y_i`，组内优势为：
 
-$$
-\hat{A}_i =
-\frac{r(x,y_i)-\operatorname{mean}\left(\{r(x,y_j)\}_{j=1}^{G}\right)}
-{\operatorname{std}\left(\{r(x,y_j)\}_{j=1}^{G}\right)+\varepsilon}
-$$
+```math
+\hat{A}_i = \frac{r_i-\mathrm{mean}(r_1,\ldots,r_G)}{\mathrm{std}(r_1,\ldots,r_G)+\varepsilon}
+```
 
 这种相对比较具有两个特点：
 
@@ -72,11 +70,9 @@ $$
 
 轨迹由旧策略生成，而梯度用于更新新策略，因此需要用重要性采样修正两个策略之间的分布差异。GRPO 为回答中的每个 token 分别计算概率比率：
 
-$$
-w_{i,t}(\theta)=
-\frac{\pi_\theta(y_{i,t}\mid x,y_{i,<t})}
-{\pi_{\theta_{old}}(y_{i,t}\mid x,y_{i,<t})}
-$$
+```math
+w_{i,t}(\theta) = \frac{\pi_\theta(y_{i,t}\mid x,y_{i,<t})}{\pi_{old}(y_{i,t}\mid x,y_{i,<t})}
+```
 
 当比率明显偏离 1 时，表示新旧策略对该 token 的概率判断差距较大。PPO 风格的裁剪会将比率限制在 `1-ε` 到 `1+ε` 附近，避免单个 batch 造成过大的策略更新。
 
@@ -84,17 +80,15 @@ $$
 
 目标函数：
 
-$$
-J_{GRPO}(\theta)=E\left[\frac{1}{G} \sum_{i=1}^G \frac{1}{\left|y_i\right|} \sum_{t=1}^{\left|y_i\right|} \min \left(w_{i, t}(\theta) \hat{A}_{i, t}, \text{clip}\left(w_{i, t}(\theta), 1-\epsilon, 1+\epsilon\right) \hat{A}_{i, t}\right)\right]
-$$
+```math
+J_{\mathrm{GRPO}}(\theta)=\mathbb{E}\left[\frac{1}{G}\sum_{i=1}^{G}\frac{1}{|y_i|}\sum_{t=1}^{|y_i|}\min\left(w_{i,t}(\theta)\hat{A}_i,\mathrm{clip}(w_{i,t}(\theta),1-\epsilon,1+\epsilon)\hat{A}_i\right)\right]
+```
 
 这里 `w_{i,t}` 是 token 级重要性采样比率，`A_i` 是第 `i` 条完整回答的组内优势。代码中还加入参考策略 KL 惩罚，用于抑制新策略过度偏离预训练模型：
 
-$$
-D_{KL}(\pi_\theta\|\pi_{ref})
-\approx \exp(\log \pi_{ref}-\log \pi_\theta)
--(\log \pi_{ref}-\log \pi_\theta)-1
-$$
+```math
+D_{KL}(\pi_\theta\|\pi_{ref}) \approx \exp(\log\pi_{ref}-\log\pi_\theta)-(\log\pi_{ref}-\log\pi_\theta)-1
+```
 
 最终目标由三部分组成：相对优势、裁剪后的重要性采样，以及参考策略 KL 约束。
 
@@ -130,9 +124,9 @@ GSPO（Group Sequence Policy Optimization）保留组内相对优势，但将新
 
 完整序列概率是所有生成 token 条件概率的乘积。直接连乘容易数值下溢，而且会让比率随序列长度呈指数变化，因此 GSPO 在 log 空间求平均，再通过指数函数还原。这等价于 token 概率比率的几何平均：
 
-$$
-s_i(\theta)=\left(\frac{\pi_\theta\left(y_i \mid x\right)}{\pi_{\theta_{\text {old }}}\left(y_i \mid x\right)}\right)^{\frac{1}{\left|y_i\right|}}=\exp \left(\frac{1}{\left|y_i\right|} \sum_{t=1}^{\left|y_i\right|} \log \frac{\pi_\theta\left(y_{i, t} \mid x, y_{i,<t}\right)}{\pi_{\theta_{\text {old }}}\left(y_{i, t} \mid x, y_{i,<t}\right)}\right)
-$$
+```math
+s_i(\theta)=\exp\left(\frac{1}{|y_i|}\sum_{t=1}^{|y_i|}\log\frac{\pi_\theta(y_{i,t}\mid x,y_{i,<t})}{\pi_{old}(y_{i,t}\mid x,y_{i,<t})}\right)
+```
 
 其中 `s_i(θ)` 表示第 `i` 条回答的序列级重要性采样比率。除以有效序列长度后，不同回答长度之间更容易比较，并且 `s_i(θ)` 与序列级组内优势 `A_i` 在粒度上保持一致。
 
@@ -140,9 +134,9 @@ $$
 
 GSPO 对每条序列的单一比率进行裁剪：如果序列级比率仍在信任区域内，则按照优势更新；如果偏移过大，则使用裁剪后的比率限制更新幅度。
 
-$$
-J_{GSPO}(\theta)=E\left[\frac{1}{G} \sum_{i=1}^G \min \left(s_i(\theta) \hat{A}_i, \text{clip}\left(s_i(\theta), 1-\epsilon, 1+\epsilon\right) \hat{A}_i\right)\right]
-$$
+```math
+J_{\mathrm{GSPO}}(\theta)=\mathbb{E}\left[\frac{1}{G}\sum_{i=1}^{G}\min\left(s_i(\theta)\hat{A}_i,\mathrm{clip}(s_i(\theta),1-\epsilon,1+\epsilon)\hat{A}_i\right)\right]
+```
 
 相较 GRPO，GSPO 的主要特点是：
 
