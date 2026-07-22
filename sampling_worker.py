@@ -38,6 +38,7 @@ class SamplingWorker:
         self.num_answers_per_question = config["data"]["num_answers_per_question"]
         self.num_questions_per_batch = self.sample_batch_size // self.num_answers_per_question
         self.zmq_data_port = config["communication"]["data_port"]
+        self.sync_interval = int(config["training"]["sync_interval"])
         self.ckpt_dir = Path(config["checkpoint"]["ckpt_dir"])
         self.ckpt_file = config["checkpoint"]["ckpt_file"]
         self.use_lora = config["lora"]["enabled"]
@@ -202,10 +203,11 @@ class SamplingWorker:
                 print(f"{time.time() - last_sample_time:.2f}s, 采样{self.sample_batch_size}条数据, {self.num_questions_per_batch}个问题, 奖励为: {rewards}")
                 last_sample_time = time.time()
 
-                if sample_count % 10 == 0:
+                if sample_count % self.sync_interval == 0:
                     if self.use_lora:
                         print(f"采样进程已采样 {sample_count} 批数据, 并尝试加载最新LoRA模型参数")
-                        if not self.lora_adapter_dir:
+                        adapter_config = self.lora_adapter_dir / "adapter_config.json"
+                        if not adapter_config.exists():
                             print(f"最新LoRA模型参数不存在, 跳过")
                         else:
                             try:
@@ -220,7 +222,7 @@ class SamplingWorker:
                     else:
                         print(f"采样进程已采样 {sample_count} 批数据, 并尝试加载最新全量模型参数")
                         ckpt_path = self.ckpt_dir / self.ckpt_file
-                        if not ckpt_path:
+                        if not ckpt_path.exists():
                             print(f"最新全量模型参数不存在, 跳过")
                         else:
                             try:
