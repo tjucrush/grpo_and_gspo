@@ -71,7 +71,7 @@ GRPO（Group Relative Policy Optimization）的核心做法是：针对同一个
 轨迹由旧策略生成，而梯度用于更新新策略，因此需要用重要性采样修正两个策略之间的分布差异。GRPO 为回答中的每个 token 分别计算概率比率：
 
 ```math
-w_{i,t}(\theta) = \frac{\pi_\theta(y_{i,t}\mid x,y_{i,<t})}{\pi_{old}(y_{i,t}\mid x,y_{i,<t})}
+w_{i,t}(\theta) = \frac{\pi_\theta(y_{i,t}\mid x,y_{i,1:t-1})}{\pi_{old}(y_{i,t}\mid x,y_{i,1:t-1})}
 ```
 
 当比率明显偏离 1 时，表示新旧策略对该 token 的概率判断差距较大。PPO 风格的裁剪会将比率限制在 `1-ε` 到 `1+ε` 附近，避免单个 batch 造成过大的策略更新。
@@ -125,7 +125,7 @@ GSPO（Group Sequence Policy Optimization）保留组内相对优势，但将新
 完整序列概率是所有生成 token 条件概率的乘积。直接连乘容易数值下溢，而且会让比率随序列长度呈指数变化，因此 GSPO 在 log 空间求平均，再通过指数函数还原。这等价于 token 概率比率的几何平均：
 
 ```math
-s_i(\theta)=\exp\left(\frac{1}{|y_i|}\sum_{t=1}^{|y_i|}\log\frac{\pi_\theta(y_{i,t}\mid x,y_{i,<t})}{\pi_{old}(y_{i,t}\mid x,y_{i,<t})}\right)
+s_i(\theta)=\exp\left(\frac{1}{|y_i|}\sum_{t=1}^{|y_i|}\log\frac{\pi_\theta(y_{i,t}\mid x,y_{i,1:t-1})}{\pi_{old}(y_{i,t}\mid x,y_{i,1:t-1})}\right)
 ```
 
 其中 `s_i(θ)` 表示第 `i` 条回答的序列级重要性采样比率。除以有效序列长度后，不同回答长度之间更容易比较，并且 `s_i(θ)` 与序列级组内优势 `A_i` 在粒度上保持一致。
