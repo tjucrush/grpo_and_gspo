@@ -43,9 +43,12 @@ class TrainingWorker:
         self.num_answers_per_question = config["data"]["num_answers_per_question"]
         self.num_questions_per_batch = self.train_batch_size // self.num_answers_per_question
         self.use_gspo = config["training"]["use_gspo"]
+        self.learning_rate = float(config["training"]["learning_rate"])
+        self.max_grad_norm = float(config["training"]["max_grad_norm"])
         self.eval_interval = config["training"]["eval_interval"]
         self.sync_interval = config["training"]["sync_interval"]
         self.zmq_data_port = config["communication"]["data_port"]
+        self.zmq_timeout = int(config["communication"]["timeout"])
         self.ds_config_path = config["deepspeed"]["config_path"]
         self.ckpt_dir = Path(config["checkpoint"]["ckpt_dir"])
         self.ckpt_file = config["checkpoint"]["ckpt_file"]
@@ -53,7 +56,7 @@ class TrainingWorker:
         self.lora_rank = config["lora"]["rank"]
         self.lora_alpha = config["lora"]["alpha"]
         self.lora_lr = float(config["lora"]["learning_rate"])
-        self.lora_dropoutp = config["lora"]["dropout"]
+        self.lora_dropout = float(config["lora"]["dropout"])
         self.lora_adapter_dir = Path(config["lora"]["adapter_dir"])
         self.ckpt_dir.mkdir(parents=True, exist_ok=True)
         self.lora_adapter_dir.mkdir(parents=True, exist_ok=True)
@@ -88,7 +91,7 @@ class TrainingWorker:
                 r=self.lora_rank,
                 lora_alpha=self.lora_alpha,
                 target_modules="q_proj,v_proj,k_proj,o_proj,gate_proj,down_proj,up_proj".split(","),
-                lora_dropout=0.1,
+                lora_dropout=self.lora_dropout,
                 bias="none",
                 task_type="CAUSAL_LM"
             )
@@ -121,8 +124,10 @@ class TrainingWorker:
         # 加载模型参数
         model_parameters = list(self.new_policy_model.parameters())
 
-        if self.use_lora:
-            ds_config['optimizer']['params']['lr'] = self.lora_lr
+        ds_config['optimizer']['params']['lr'] = (
+            self.lora_lr if self.use_lora else self.learning_rate
+        )
+        ds_config['gradient_clipping'] = self.max_grad_norm
 
         # 初始化DeepSpeed引擎
         self.model_engine, self.optimizer, _, self.scheduler = deepspeed.initialize(
@@ -134,8 +139,6 @@ class TrainingWorker:
         self.device=self.model_engine.device
         print(f"DeepSpeed初始化完成，世界大小: {self.model_engine.world_size}")
 
-        # 梯度裁剪参数
-        self.max_grad_norm = 1.0
         print("模型和优化器初始化完成")
 
     def setup_zmq(self):
@@ -152,11 +155,6 @@ class TrainingWorker:
             # 非主进程不需要ZMQ连接
             self.data_receiver = None
             print(f"Rank {self.rank} 进程跳过ZMQ连接（由rank 0处理）")
-
-        # 数据接收socket（PULL模式）
-        self.data_receiver = self.context.socket(zmq.PULL)
-        self.data_receiver.connect(f"tcp://localhost:{self.zmq_data_port}")
-        print(f"ZeroMQ数据接收端口连接: {self.zmq_data_port}")
 
     def deserialize_episodes(self, serialized_data):
         """反序列化episodes数据"""
@@ -184,10 +182,11 @@ class TrainingWorker:
             if self.is_main_process:
                 serialized_data = pickle.dumps(episodes)
                 np_data = np.frombuffer(serialized_data, dtype=np.uint8)
-                size_tensor = torch.from_numpy(np.array([len(np_data)], dtype=np.int64)).to(self.device)
-                episodes_tensor = torch.from_numpy(np_data.copy()).to(self.device)
+                # Gloo 使用 CPU tensor 广播，避免 CUDA tensor 与 backend 不兼容。
+                size_tensor = torch.from_numpy(np.array([len(np_data)], dtype=np.int64))
+                episodes_tensor = torch.from_numpy(np_data.copy())
             else:
-                size_tensor = torch.zeros(1, dtype=torch.int64, device=self.device)
+                size_tensor = torch.zeros(1, dtype=torch.int64)
                 episodes_tensor = None
 
             # 广播数据长度
@@ -195,7 +194,7 @@ class TrainingWorker:
             data_size = size_tensor.item()
 
             if not self.is_main_process:
-                episodes_tensor = torch.zeros(data_size, dtype=torch.uint8, device=self.device)
+                episodes_tensor = torch.zeros(data_size, dtype=torch.uint8)
 
             # 广播实际数据（每个rank接收自己的部分）
             dist.broadcast(episodes_tensor, src=0)
@@ -347,7 +346,7 @@ class TrainingWorker:
                     # 数据接收逻辑：只有rank=0从ZMQ接收，其他rank等待广播
                     if self.is_main_process:
                         # 主进程从ZMQ接收数据
-                        if self.data_receiver and self.data_receiver.poll(100):  # 100ms超时
+                        if self.data_receiver and self.data_receiver.poll(self.zmq_timeout):
                             data = self.data_receiver.recv()
                             serialized_episodes = pickle.loads(data)
                             episodes = self.deserialize_episodes(serialized_episodes)
@@ -378,11 +377,13 @@ class TrainingWorker:
                     # 定期同步模型参数（只有主进程需要同步到采样进程）
                     if self.is_main_process and train_step % self.sync_interval == 0:
                         if self.use_lora:
-                            self.model_engine.save_pretrained(self.lora_adapter_dir)
+                            self.model_engine.module.save_pretrained(self.lora_adapter_dir)
                             print(f"第 {train_step} 步训练后保存LoRA模型参数至 {self.lora_adapter_dir}")
                         else:
                             output_file = self.ckpt_dir / self.ckpt_file
-                            torch.save(self.model_engine.module.state_dict(), output_file)
+                            temporary_file = output_file.with_suffix(output_file.suffix + ".tmp")
+                            torch.save(self.model_engine.module.state_dict(), temporary_file)
+                            os.replace(temporary_file, output_file)
                             print(f"第 {train_step} 步训练后保存全量模型参数至 {output_file}")
 
                     # 定期评估模型性能(只在主进程进行评估)
