@@ -49,6 +49,8 @@
 
 ## GRPO 算法原理
 
+![GRPO 完整流程图](./docs/grpo.png)
+
 ### 1. 从 PPO 到 GRPO
 
 PPO 通常同时训练策略模型（Actor）与价值模型（Critic）。对于大语言模型，额外维护一个同等规模的 Critic 会显著增加显存、计算量和工程复杂度。
